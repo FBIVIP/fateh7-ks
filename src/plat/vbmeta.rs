@@ -1,0 +1,702 @@
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{anyhow, bail, Context, Result};
+use kmr_common::crypto::{Rng, Sha256};
+use kmr_crypto_boring::{rng::BoringRng, sha256::BoringSha256};
+use rsbinder::Strong;
+
+use crate::{
+    android::{
+        hardware::security::keymint::{
+            Algorithm::Algorithm, Digest::Digest, EcCurve::EcCurve, KeyParameter::KeyParameter,
+            KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose,
+            SecurityLevel::SecurityLevel, Tag::Tag,
+        },
+        system::keystore2::{
+            Domain::Domain, IKeystoreSecurityLevel::IKeystoreSecurityLevel,
+            KeyDescriptor::KeyDescriptor, KeyMetadata::KeyMetadata,
+        },
+    },
+    config::{ConfigFile, ResolvedTrust, TrustRecord, TrustValueSource, TrustValueSpec},
+    plat::{attestation, resetprop, utils::get_keystore_service},
+};
+
+const SECURITY_PATCH_PROP: &str = "ro.build.version.security_patch";
+const VBMETA_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
+const VBMETA_HASH_PROP: &str = "ro.boot.vbmeta.digest";
+const ORIGINAL_HASH_TIMEOUT: Duration = Duration::from_secs(5);
+const AVB_HEADER_SIZE: usize = 256;
+const BUILD_PROP_PATHS: &[&str] = &[
+    "/system/build.prop",
+    "/system/system/build.prop",
+    "/product/build.prop",
+    "/system_ext/build.prop",
+    "/vendor/build.prop",
+    "/odm/build.prop",
+    "/vendor/default.prop",
+    "/default.prop",
+];
+
+#[derive(Clone)]
+struct ResolvedField {
+    value: [u8; 32],
+    source: TrustValueSource,
+}
+
+pub fn bootstrap_vbmeta(config_file: &mut ConfigFile) -> Result<ResolvedTrust> {
+    let slot_suffix = resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
+    let build_fingerprint =
+        resetprop::read_string_property("ro.build.fingerprint").unwrap_or_default();
+    let security_patch = resolve_and_sync_security_patch(
+        &config_file.trust.security_patch,
+        &mut config_file.trust_record,
+    )?;
+
+    let vb_key = resolve_vb_key(
+        &config_file.trust.vb_key,
+        config_file.trust.device_locked,
+        &slot_suffix,
+    );
+    let vb_hash = resolve_vb_hash(&config_file.trust.vb_hash);
+
+    let vb_key = match vb_key {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("Failed to resolve vb_key: {error:#}");
+            return Err(error);
+        }
+    };
+    let vb_hash = match vb_hash {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("Failed to resolve vb_hash: {error:#}");
+            return Err(error);
+        }
+    };
+
+    sync_sysprops_if_needed(&vb_key, &vb_hash)?;
+    update_trust_record(
+        &mut config_file.trust_record,
+        &build_fingerprint,
+        &slot_suffix,
+        &vb_key,
+        &vb_hash,
+    );
+
+    let vb_key_hex = hex::encode(vb_key.value);
+    let vb_hash_hex = hex::encode(vb_hash.value);
+    log::info!(
+        "Resolved vbmeta trust: vb_key={} source={} vb_hash={} source={}",
+        vb_key_hex,
+        vb_key.source,
+        vb_hash_hex,
+        vb_hash.source
+    );
+
+    Ok(ResolvedTrust {
+        os_version: config_file.trust.os_version,
+        security_patch,
+        vb_key: vb_key.value,
+        vb_hash: vb_hash.value,
+        vb_key_source: vb_key.source,
+        vb_hash_source: vb_hash.source,
+        verified_boot_state: config_file.trust.verified_boot_state,
+        device_locked: config_file.trust.device_locked,
+    })
+}
+
+pub fn apply_runtime_security_patch(
+    record: &TrustRecord,
+    security_patch_spec: &str,
+) -> Result<String> {
+    let original = record
+        .original_security_patch
+        .as_deref()
+        .ok_or_else(|| anyhow!("original security patch is unavailable in trust_record"))?;
+    let resolved = resolve_security_patch_value(security_patch_spec, original)?;
+    if resetprop::read_string_property(SECURITY_PATCH_PROP).as_deref() != Some(resolved.as_str()) {
+        resetprop::runtime_write_and_verify_property(SECURITY_PATCH_PROP, &resolved)?;
+    }
+    Ok(resolved)
+}
+
+fn resolve_vb_key(
+    spec: &TrustValueSpec,
+    device_locked: bool,
+    slot_suffix: &str,
+) -> Result<ResolvedField> {
+    match spec {
+        TrustValueSpec::Hex(value) => Ok(ResolvedField {
+            value: *value,
+            source: TrustValueSource::ExplicitHex,
+        }),
+        TrustValueSpec::Random => Ok(random_field(TrustValueSource::RandomExplicit)),
+        TrustValueSpec::Auto => {
+            if let Some(value) = read_hex_property(VBMETA_KEY_PROP) {
+                return Ok(ResolvedField {
+                    value,
+                    source: TrustValueSource::Property,
+                });
+            }
+
+            match compute_vbmeta_public_key_digest(slot_suffix, device_locked) {
+                Ok(value) => Ok(ResolvedField {
+                    value,
+                    source: TrustValueSource::Computed,
+                }),
+                Err(error) => {
+                    log::warn!("Computed vbmeta public key digest unavailable: {error:#}");
+                    Ok(random_field(TrustValueSource::RandomFallback))
+                }
+            }
+        }
+    }
+}
+
+fn resolve_vb_hash(spec: &TrustValueSpec) -> Result<ResolvedField> {
+    match spec {
+        TrustValueSpec::Hex(value) => Ok(ResolvedField {
+            value: *value,
+            source: TrustValueSource::ExplicitHex,
+        }),
+        TrustValueSpec::Random => Ok(random_field(TrustValueSource::RandomExplicit)),
+        TrustValueSpec::Auto => {
+            if let Some(value) = read_hex_property(VBMETA_HASH_PROP) {
+                return Ok(ResolvedField {
+                    value,
+                    source: TrustValueSource::Property,
+                });
+            }
+
+            match probe_original_verified_boot_hash_with_timeout(ORIGINAL_HASH_TIMEOUT) {
+                Ok(value) => Ok(ResolvedField {
+                    value,
+                    source: TrustValueSource::Original,
+                }),
+                Err(error) => {
+                    log::warn!("Original verified boot hash unavailable: {error:#}");
+                    Ok(random_field(TrustValueSource::RandomFallback))
+                }
+            }
+        }
+    }
+}
+
+fn random_field(source: TrustValueSource) -> ResolvedField {
+    let mut rng = BoringRng {};
+    let mut value = [0u8; 32];
+    rng.fill_bytes(&mut value);
+    ResolvedField { value, source }
+}
+
+fn resolve_and_sync_security_patch(
+    security_patch_spec: &str,
+    record: &mut TrustRecord,
+) -> Result<String> {
+    let original = read_build_prop_security_patch()
+        .or_else(|| resetprop::read_string_property(SECURITY_PATCH_PROP))
+        .ok_or_else(|| anyhow!("failed to resolve original security patch from build props"))?;
+    let resolved = resolve_security_patch_value(security_patch_spec, &original)?;
+
+    record.original_security_patch = Some(original.clone());
+    if resetprop::read_string_property(SECURITY_PATCH_PROP).as_deref() != Some(resolved.as_str()) {
+        resetprop::direct_write_and_verify_property(SECURITY_PATCH_PROP, &resolved)?;
+    }
+    Ok(resolved)
+}
+
+fn resolve_security_patch_value(security_patch_spec: &str, original: &str) -> Result<String> {
+    match security_patch_spec.trim() {
+        "auto" => Ok(original.to_string()),
+        "latest" => {
+            let (year, month) = current_year_month()?;
+            Ok(format!("{year:04}-{month:02}-05"))
+        }
+        value if crate::config::is_security_patch_date(value) => Ok(value.to_string()),
+        value => Err(anyhow!("invalid security_patch value: {value}")),
+    }
+}
+
+fn read_build_prop_security_patch() -> Option<String> {
+    for path in BUILD_PROP_PATHS {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(value) = parse_build_prop_value(&contents, SECURITY_PATCH_PROP) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_build_prop_value(contents: &str, key: &str) -> Option<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .find_map(|line| {
+            let (candidate_key, candidate_value) = line.split_once('=')?;
+            (candidate_key.trim() == key).then(|| candidate_value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn current_year_month() -> Result<(i32, u32)> {
+    #[cfg(unix)]
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        if now < 0 {
+            bail!("libc::time returned a negative timestamp");
+        }
+        let mut local = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&now, &mut local).is_null() {
+            bail!("libc::localtime_r failed");
+        }
+        Ok((local.tm_year + 1900, (local.tm_mon + 1) as u32))
+    }
+
+    #[cfg(not(unix))]
+    {
+        Err(anyhow!(
+            "current_year_month is unsupported on this platform"
+        ))
+    }
+}
+
+fn update_trust_record(
+    record: &mut TrustRecord,
+    build_fingerprint: &str,
+    slot_suffix: &str,
+    vb_key: &ResolvedField,
+    vb_hash: &ResolvedField,
+) {
+    let original_security_patch = record.original_security_patch.clone();
+    *record = TrustRecord::default();
+    record.original_security_patch = original_security_patch;
+
+    if vb_key.source.should_record_in_config() {
+        record.vb_key = Some(hex::encode(vb_key.value));
+        record.vb_key_source = Some(vb_key.source);
+    }
+
+    if vb_hash.source.should_record_in_config() {
+        record.vb_hash = Some(hex::encode(vb_hash.value));
+        record.vb_hash_source = Some(vb_hash.source);
+    }
+
+    if !record.is_empty() {
+        if !build_fingerprint.is_empty() {
+            record.build_fingerprint = Some(build_fingerprint.to_string());
+        }
+        if !slot_suffix.is_empty() {
+            record.slot_suffix = Some(slot_suffix.to_string());
+        }
+    }
+}
+
+fn sync_sysprops_if_needed(vb_key: &ResolvedField, vb_hash: &ResolvedField) -> Result<()> {
+    if vb_key.source.needs_sysprop_write() {
+        let value = hex::encode(vb_key.value);
+        resetprop::direct_write_and_verify_property(VBMETA_KEY_PROP, &value)?;
+    }
+
+    if vb_hash.source.needs_sysprop_write() {
+        let value = hex::encode(vb_hash.value);
+        resetprop::direct_write_and_verify_property(VBMETA_HASH_PROP, &value)?;
+    }
+
+    Ok(())
+}
+
+fn read_hex_property(name: &str) -> Option<[u8; 32]> {
+    let value = resetprop::read_string_property(name)?;
+    match parse_hex_32(&value) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            log::warn!("Ignoring invalid property {name}={value}: {error:#}");
+            None
+        }
+    }
+}
+
+fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
+    let decoded = hex::decode(value).with_context(|| format!("invalid hex value {value}"))?;
+    if decoded.len() != 32 {
+        bail!("hex value must be 32 bytes, got {}", decoded.len());
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+impl TrustValueSource {
+    fn needs_sysprop_write(self) -> bool {
+        matches!(
+            self,
+            TrustValueSource::Computed
+                | TrustValueSource::Original
+                | TrustValueSource::RandomExplicit
+                | TrustValueSource::RandomFallback
+        )
+    }
+
+    fn should_record_in_config(self) -> bool {
+        matches!(
+            self,
+            TrustValueSource::Computed | TrustValueSource::Original
+        )
+    }
+}
+
+fn compute_vbmeta_public_key_digest(slot_suffix: &str, device_locked: bool) -> Result<[u8; 32]> {
+    if !device_locked {
+        return Ok([0u8; 32]);
+    }
+
+    let path = find_top_level_vbmeta_path(slot_suffix)?;
+    let vbmeta_bytes = load_vbmeta_blob(&path)
+        .with_context(|| format!("failed to read vbmeta image {}", path.display()))?;
+    compute_vbmeta_public_key_digest_from_bytes(&vbmeta_bytes)
+}
+
+fn find_top_level_vbmeta_path(slot_suffix: &str) -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !slot_suffix.is_empty() {
+        candidates.push(PathBuf::from(format!(
+            "/dev/block/by-name/vbmeta{slot_suffix}"
+        )));
+        candidates.push(PathBuf::from(format!(
+            "/dev/block/bootdevice/by-name/vbmeta{slot_suffix}"
+        )));
+    }
+    candidates.push(PathBuf::from("/dev/block/by-name/vbmeta"));
+    candidates.push(PathBuf::from("/dev/block/bootdevice/by-name/vbmeta"));
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "no top-level vbmeta partition found for slot suffix '{}'",
+        slot_suffix
+    ))
+}
+
+fn load_vbmeta_blob(path: &Path) -> Result<Vec<u8>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open vbmeta image {}", path.display()))?;
+    let mut header = [0u8; AVB_HEADER_SIZE];
+    file.read_exact(&mut header)
+        .with_context(|| format!("failed to read vbmeta header from {}", path.display()))?;
+
+    if &header[..4] != b"AVB0" {
+        bail!("{} does not start with AVB0 magic", path.display());
+    }
+
+    let auth_block_size = be_u64(&header[12..20])?;
+    let aux_block_size = be_u64(&header[20..28])?;
+    let total_size = AVB_HEADER_SIZE
+        .checked_add(auth_block_size)
+        .and_then(|value| value.checked_add(aux_block_size))
+        .ok_or_else(|| anyhow!("vbmeta size overflow"))?;
+
+    let mut blob = vec![0u8; total_size];
+    blob[..AVB_HEADER_SIZE].copy_from_slice(&header);
+    file.read_exact(&mut blob[AVB_HEADER_SIZE..])
+        .with_context(|| {
+            format!(
+                "failed to read {} bytes of vbmeta data from {}",
+                total_size - AVB_HEADER_SIZE,
+                path.display()
+            )
+        })?;
+    Ok(blob)
+}
+
+fn compute_vbmeta_public_key_digest_from_bytes(vbmeta_bytes: &[u8]) -> Result<[u8; 32]> {
+    if vbmeta_bytes.len() < AVB_HEADER_SIZE {
+        bail!("vbmeta blob too small");
+    }
+    if &vbmeta_bytes[..4] != b"AVB0" {
+        bail!("vbmeta blob missing AVB0 magic");
+    }
+
+    let auth_block_size = be_u64(&vbmeta_bytes[12..20])?;
+    let public_key_offset = be_u64(&vbmeta_bytes[64..72])?;
+    let public_key_size = be_u64(&vbmeta_bytes[72..80])?;
+    if public_key_size == 0 {
+        bail!("vbmeta public key size is zero");
+    }
+
+    let key_start = AVB_HEADER_SIZE
+        .checked_add(auth_block_size)
+        .and_then(|value| value.checked_add(public_key_offset))
+        .ok_or_else(|| anyhow!("vbmeta public key start overflow"))?;
+    let key_end = key_start
+        .checked_add(public_key_size)
+        .ok_or_else(|| anyhow!("vbmeta public key end overflow"))?;
+    if key_end > vbmeta_bytes.len() {
+        bail!(
+            "vbmeta public key range [{}..{}) exceeds blob length {}",
+            key_start,
+            key_end,
+            vbmeta_bytes.len()
+        );
+    }
+
+    BoringSha256 {}
+        .hash(&vbmeta_bytes[key_start..key_end])
+        .map_err(|error| anyhow!("failed to hash vbmeta public key: {error:?}"))
+}
+
+fn be_u64(bytes: &[u8]) -> Result<usize> {
+    let array: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("expected 8 bytes, got {}", bytes.len()))?;
+    usize::try_from(u64::from_be_bytes(array)).context("value does not fit in usize")
+}
+
+fn probe_original_verified_boot_hash_with_timeout(timeout: Duration) -> Result<[u8; 32]> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result =
+            probe_original_verified_boot_hash_inner().map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(anyhow!(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(anyhow!("timed out while probing system verified boot hash"))
+        }
+        Err(error) => Err(anyhow!("system verified boot hash probe failed: {error}")),
+    }
+}
+
+fn probe_original_verified_boot_hash_inner() -> Result<[u8; 32]> {
+    let service = get_keystore_service().context("failed to connect to system keystore")?;
+    let tee = service
+        .getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT)
+        .context("failed to get system TEE security level")?;
+
+    if let Ok(metadata) = generate_blob_attested_key(&tee) {
+        return extract_verified_boot_hash_from_metadata(&metadata);
+    }
+
+    let alias = format!(
+        "omk-vbhash-probe-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let descriptor = app_descriptor(&alias);
+    let result = tee.generateKey(&descriptor, None, &attested_ec_params(), 0, &[]);
+    let metadata = result.context("fallback APP attestation key generation failed")?;
+    let extracted = extract_verified_boot_hash_from_metadata(&metadata);
+    if let Err(error) = service.deleteKey(&descriptor) {
+        log::warn!("Failed to delete fallback APP vbhash probe key {alias}: {error:?}");
+    }
+    extracted
+}
+
+fn generate_blob_attested_key(
+    security_level: &Strong<dyn IKeystoreSecurityLevel>,
+) -> Result<KeyMetadata> {
+    let descriptor = KeyDescriptor {
+        domain: Domain::BLOB,
+        nspace: 0,
+        alias: None,
+        blob: None,
+    };
+    security_level
+        .generateKey(&descriptor, None, &attested_ec_params(), 0, &[])
+        .context("BLOB attestation key generation failed")
+}
+
+fn app_descriptor(alias: &str) -> KeyDescriptor {
+    KeyDescriptor {
+        domain: Domain::APP,
+        nspace: 0,
+        alias: Some(alias.to_string()),
+        blob: None,
+    }
+}
+
+fn attested_ec_params() -> Vec<KeyParameter> {
+    vec![
+        kp(Tag::ALGORITHM, KeyParameterValue::Algorithm(Algorithm::EC)),
+        kp(Tag::EC_CURVE, KeyParameterValue::EcCurve(EcCurve::P_256)),
+        kp(Tag::KEY_SIZE, KeyParameterValue::Integer(256)),
+        kp(Tag::DIGEST, KeyParameterValue::Digest(Digest::SHA_2_256)),
+        kp(
+            Tag::PURPOSE,
+            KeyParameterValue::KeyPurpose(KeyPurpose::SIGN),
+        ),
+        kp(
+            Tag::ATTESTATION_CHALLENGE,
+            KeyParameterValue::Blob(b"omk-vbmeta-probe".to_vec()),
+        ),
+    ]
+}
+
+fn kp(tag: Tag, value: KeyParameterValue) -> KeyParameter {
+    KeyParameter { tag, value }
+}
+
+fn extract_verified_boot_hash_from_metadata(metadata: &KeyMetadata) -> Result<[u8; 32]> {
+    let leaf = metadata
+        .certificate
+        .as_deref()
+        .ok_or_else(|| anyhow!("attestation leaf certificate missing"))?;
+    extract_verified_boot_hash_from_leaf_certificate(leaf)
+}
+
+fn extract_verified_boot_hash_from_leaf_certificate(leaf: &[u8]) -> Result<[u8; 32]> {
+    attestation::extract_verified_boot_hash_from_leaf_certificate(leaf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avb_public_key_digest_matches_embedded_blob_hash() {
+        let public_key = b"test-public-key-material";
+        let vbmeta = build_test_vbmeta(public_key, 64, 96);
+        let digest = compute_vbmeta_public_key_digest_from_bytes(&vbmeta).unwrap();
+        let expected = BoringSha256 {}.hash(public_key).unwrap();
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn trust_record_persists_only_deterministic_sources() {
+        let mut record = TrustRecord::default();
+        let vb_key = ResolvedField {
+            value: [0x11; 32],
+            source: TrustValueSource::Computed,
+        };
+        let vb_hash = ResolvedField {
+            value: [0x22; 32],
+            source: TrustValueSource::Original,
+        };
+        let expected_vb_key = hex::encode([0x11; 32]);
+        let expected_vb_hash = hex::encode([0x22; 32]);
+
+        update_trust_record(&mut record, "fingerprint", "_b", &vb_key, &vb_hash);
+
+        assert_eq!(record.vb_key.as_deref(), Some(expected_vb_key.as_str()));
+        assert_eq!(record.vb_key_source, Some(TrustValueSource::Computed));
+        assert_eq!(record.vb_hash.as_deref(), Some(expected_vb_hash.as_str()));
+        assert_eq!(record.vb_hash_source, Some(TrustValueSource::Original));
+        assert_eq!(record.build_fingerprint.as_deref(), Some("fingerprint"));
+        assert_eq!(record.slot_suffix.as_deref(), Some("_b"));
+    }
+
+    #[test]
+    fn trust_record_skips_random_sources() {
+        let mut record = TrustRecord::default();
+        let vb_key = ResolvedField {
+            value: [0x33; 32],
+            source: TrustValueSource::RandomExplicit,
+        };
+        let vb_hash = ResolvedField {
+            value: [0x44; 32],
+            source: TrustValueSource::RandomFallback,
+        };
+
+        update_trust_record(&mut record, "fingerprint", "_a", &vb_key, &vb_hash);
+
+        assert!(record.is_empty());
+    }
+
+    #[test]
+    fn parse_build_prop_value_ignores_comments_and_requires_exact_key() {
+        let parsed = parse_build_prop_value(
+            r#"
+# comment
+ro.build.version.security_patch = 2025-12-01
+ro.build.version.security_patch.extra = ignored
+"#,
+            SECURITY_PATCH_PROP,
+        );
+        assert_eq!(parsed.as_deref(), Some("2025-12-01"));
+    }
+
+    #[test]
+    fn resolve_security_patch_value_supports_auto_and_explicit_modes() {
+        assert_eq!(
+            resolve_security_patch_value("auto", "2025-12-01").unwrap(),
+            "2025-12-01"
+        );
+        assert_eq!(
+            resolve_security_patch_value("2026-04-05", "2025-12-01").unwrap(),
+            "2026-04-05"
+        );
+    }
+
+    #[test]
+    fn resolve_security_patch_value_latest_uses_monthly_fifth() {
+        let latest = resolve_security_patch_value("latest", "2025-12-01").unwrap();
+        assert!(crate::config::is_security_patch_date(&latest));
+        assert!(latest.ends_with("-05"));
+    }
+
+    #[test]
+    fn update_trust_record_preserves_original_security_patch() {
+        let mut record = TrustRecord {
+            original_security_patch: Some("2025-12-01".to_string()),
+            ..TrustRecord::default()
+        };
+        let vb_key = ResolvedField {
+            value: [0x11; 32],
+            source: TrustValueSource::Computed,
+        };
+        let vb_hash = ResolvedField {
+            value: [0x22; 32],
+            source: TrustValueSource::Original,
+        };
+
+        update_trust_record(&mut record, "fingerprint", "_a", &vb_key, &vb_hash);
+
+        assert_eq!(
+            record.original_security_patch.as_deref(),
+            Some("2025-12-01")
+        );
+    }
+
+    #[test]
+    fn random_sources_still_require_sysprop_writeback() {
+        assert!(TrustValueSource::RandomExplicit.needs_sysprop_write());
+        assert!(TrustValueSource::RandomFallback.needs_sysprop_write());
+        assert!(!TrustValueSource::ExplicitHex.needs_sysprop_write());
+        assert!(!TrustValueSource::Property.needs_sysprop_write());
+    }
+
+    fn build_test_vbmeta(
+        public_key: &[u8],
+        auth_block_size: usize,
+        aux_block_size: usize,
+    ) -> Vec<u8> {
+        let total_size = AVB_HEADER_SIZE + auth_block_size + aux_block_size;
+        let mut blob = vec![0u8; total_size];
+        blob[..4].copy_from_slice(b"AVB0");
+        blob[12..20].copy_from_slice(&(auth_block_size as u64).to_be_bytes());
+        blob[20..28].copy_from_slice(&(aux_block_size as u64).to_be_bytes());
+        blob[64..72].copy_from_slice(&(0u64).to_be_bytes());
+        blob[72..80].copy_from_slice(&(public_key.len() as u64).to_be_bytes());
+        let start = AVB_HEADER_SIZE + auth_block_size;
+        blob[start..start + public_key.len()].copy_from_slice(public_key);
+        blob
+    }
+}
